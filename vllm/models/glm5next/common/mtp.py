@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -211,6 +212,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # The target embedding lives on the first stage, while drafting runs
+        # on the last. PP1 keeps the original target/draft sharing behavior.
+        self.has_own_embed_tokens = get_pp_group().world_size > 1
         self.set_moe_parameters()
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.model.layers.values(), Glm5NextMoE, "mtp_block.mlp"
@@ -310,6 +314,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        embedding_loaded = False
+        explicit_embedding_loaded = False
         _pending_wk_fp8: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
@@ -325,10 +331,29 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            is_target_embedding = name == "model.embed_tokens.weight"
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
+                if not (self.has_own_embed_tokens and is_target_embedding):
+                    continue
+            else:
+                name = self._rewrite_spec_layer_name(spec_layer, name)
+            if name == "model.embed_tokens.weight":
+                if is_target_embedding and explicit_embedding_loaded:
+                    continue
+                if (
+                    not is_target_embedding
+                    and spec_layer != self.model.mtp_start_layer_idx
+                ):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                embedding_loaded = True
+                explicit_embedding_loaded = not is_target_embedding
                 continue
-            name = self._rewrite_spec_layer_name(spec_layer, name)
+            assert spec_layer is not None
             if self.is_fused_shared_expert_enabled:
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
 
@@ -416,6 +441,14 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if self.has_own_embed_tokens and not embedding_loaded:
+            raise ValueError(
+                "GLM5Next MTP input embedding is missing under pipeline parallelism. "
+                "Include model.embed_tokens.weight or "
+                f"model.layers.{self.model.mtp_start_layer_idx}.embed_tokens.weight "
+                "in the draft checkpoint."
+            )
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:

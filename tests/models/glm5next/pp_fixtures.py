@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Small real GLM5Next configs/checkpoints for pipeline regressions."""
+"""Real GLM5Next fixtures and numerical checks for pipeline regressions."""
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -105,3 +106,37 @@ def save_tiny_glm5next_checkpoint(
         config.architectures = ["Glm5NextForCausalLM"]
         config.save_pretrained(path)
     save_file(weights, weights_path, metadata={"format": "pt"})
+
+
+def assert_pp_logprobs_close(
+    reference: Sequence[dict[int, float] | None],
+    actual: Sequence[dict[int, float] | None],
+    *,
+    reference_tokens: Sequence[int] | None = None,
+    actual_tokens: Sequence[int] | None = None,
+) -> None:
+    """Compare every fixed-history distribution, including a near-tie step.
+
+    Prompt histories are identical by construction. Sample histories are
+    identical only until their first differing generated token.
+    """
+    assert len(reference) == len(actual)
+    if reference_tokens is not None:
+        assert actual_tokens is not None
+        assert len(reference_tokens) == len(actual_tokens) == len(reference)
+    for index, (before, after) in enumerate(zip(reference, actual)):
+        if before is None:
+            assert after is None
+            continue
+        assert after is not None and before.keys() == after.keys()
+        keys = sorted(before)
+        torch.testing.assert_close(
+            torch.tensor([before[k] for k in keys], dtype=torch.float32),
+            torch.tensor([after[k] for k in keys], dtype=torch.float32),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        if reference_tokens is not None:
+            assert actual_tokens is not None
+            if reference_tokens[index] != actual_tokens[index]:
+                break

@@ -58,7 +58,8 @@ uv pip install --python .venv/bin/python torch==2.14.0 pytest \
   'transformers>=5.16.1,<5.21.0' safetensors
 .venv/bin/python -m pytest --noconftest \
   tests/models/glm5next/test_pp_transport_cpu.py \
-  tests/models/glm5next/test_pp_checkpoint_cpu.py -q
+  tests/models/glm5next/test_pp_checkpoint_cpu.py \
+  tests/models/glm5next/test_pp_logprobs_cpu.py -q
 ```
 
 On Windows, use `.venv\Scripts\python.exe` instead of `.venv/bin/python`.
@@ -88,11 +89,19 @@ weight loader and replacement decoder layers are not used.
 ```
 
 The four-GPU suite checks three partitions, full-vocabulary sample/prompt
-logprobs, greedy tokens, stage ownership, remote FP8 loading filters, and
+logprobs, stage ownership, remote FP8 loading filters, and
 MTP embedding loading/priority. Both text and multimodal wrappers are covered
 with text inputs. The random drafter fixture does not measure trained MTP
 acceptance or performance. The sixteen-GPU test uses the small checkpoint;
 full-model acceptance is a separate step.
+
+Prompt distributions are compared for every fixed input position. Sample
+distributions are compared while the generated histories agree, including
+the first near-tie divergence; distributions after different histories are
+not compared. The fixed `atol=rtol=1e-3` numerical bound is not widened to
+permit a test failure. Greedy token identity is not assumed without batch
+invariance. Callable model inspection uses the repository's `enable_pickle`
+fixture only in the test scope.
 
 ## AMD deployment validation
 

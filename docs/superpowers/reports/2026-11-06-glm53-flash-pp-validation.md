@@ -7,7 +7,7 @@
 
 已实现四状态PP边界、模型及多模态工厂委托、SP边界布局处理、远端FP8权重提前过滤，以及PP下MTP embedding独立加载/优先级/缺失错误。没有修改通用PP通信、TP/DP/EP分组或mHC计算内核。
 
-**37项CPU测试通过；真实vLLM模型、多GPU PP1/PP4、ROCm/RCCL、图像/视频数值一致性和性能均未验证。此交付是可审查、可回退的实验性补丁，不是已验证的16GPU部署。**
+**40项CPU测试通过；真实vLLM模型、多GPU PP1/PP4、ROCm/RCCL、图像/视频数值一致性和性能均未验证。此交付是可审查、可回退的实验性补丁，不是已验证的16GPU部署。**
 
 ## 改动文件与行为
 
@@ -19,6 +19,7 @@
 | `tests/models/glm5next/test_pp_transport_cpu.py` | 工厂、缺失/畸形输入、混合dtype、零token、持久buffer、动态fullgraph和35种四段数学链分区。 |
 | `tests/models/glm5next/pp_fixtures.py` | 真实Transformers构造、原checkpoint命名保存的小型17层hybrid模型，含可选独立MTP权重；约3255万参数。 |
 | `tests/models/glm5next/test_pp_checkpoint_cpu.py` | 实际验证上述checkpoint的原始权重名、shape、mHC FP32、MoE、KDA、MLA和MTP fallback布局。 |
+| `tests/models/glm5next/test_pp_logprobs_cpu.py` | 数值比较工具的三项CPU回归：允许已比较分布后的近似argmax分歧、相同token也检查数值错误、固定prompt历史逐位置检查。 |
 | `tests/models/glm5next/test_pipeline_parallel.py` | 使用真实构造器检查文本/多模态、mHC/非mHC的实例接口和工厂；本机未运行。 |
 | `tests/distributed/test_glm5next_pipeline.py` | 公共LLM入口PP1/PP4 full-vocabulary logprobs、三种分区、两种包装类、分区/embedding/norm/head所有权、FP8远端过滤、aux拒绝、PP1/PP4 MTP加载；另有16GPU TP4/PP4对TP4/PP1用例。本机未运行。 |
 | `.buildkite/test_areas/models_basic.yaml` | 原GLM5Next单元测试job增加common helper source dependency。 |
@@ -34,14 +35,15 @@
 ```powershell
 .venv\Scripts\python.exe -m pytest --noconftest `
   tests/models/glm5next/test_pp_transport_cpu.py `
-  tests/models/glm5next/test_pp_checkpoint_cpu.py -q
+  tests/models/glm5next/test_pp_checkpoint_cpu.py `
+  tests/models/glm5next/test_pp_logprobs_cpu.py -q
 ```
 
-实际结果：**37 passed**。这37项中包含对全部35种四段非空数学分区的循环断言，不把35种分区另外虚增成35项pytest测试。
+实际结果：**40 passed**。这40项中包含对全部35种四段非空数学分区的循环断言，不把35种分区另外虚增成35项pytest测试。
 
 | 检查 | 结果与范围 |
 | --- | --- |
-| CPU合同/数学/checkpoint套件 | 37 passed，无warning；零GPU |
+| CPU合同/数学/checkpoint套件 | 40 passed，无warning；零GPU |
 | RED→GREEN：新transport模块 | 先收集失败 `ModuleNotFoundError: vllm.models.common.mhc_pp`，实现后通过 |
 | RED→GREEN：标量hidden_states | 先1 failed/29 passed，原因IndexError；新增维数错误检查后整套通过 |
 | Ruff check及format | 使用仓库固定0.14.0，对新增/修改Python文件通过；相关pre-commit Ruff hooks也通过 |
@@ -77,6 +79,19 @@ TP4布局测试覆盖N=1/3/4/5/17的padding、四项分片payload复制、顺序
 - 继续在用户指定的新克隆及独立分支工作；没有额外创建worktree，没有再次请求已批准的实施权限。
 - 按已批准范围实现普通PP、MTP加载修复；PP+aux继续拒绝。SP边界代码已实现，但本机没有真实collective验证。
 - 因运行环境不足，模型/多GPU回归的RED/GREEN证据未获得；保留真实测试与失败日志，交付为实验性补丁。
-- 保留37项CPU验证与静态检查的实际范围；全量hooks初始化失败不等于相关Python检查失败，也不等于整套pre-commit通过。
+- 保留40项CPU验证与静态检查的实际范围；全量hooks初始化失败不等于相关Python检查失败，也不等于整套pre-commit通过。
 
 补丁导出以Git提交为准，不使用此前下载的PR #57171参考patch冒充本项目实现。所有远程PR/merge/push均未执行。
+
+## 独立整分支审阅
+
+审阅者对照v0.33.0检查了产品代码、V1/V2持久buffer、异步IntermediateTensors、PP的TP flat slicing、SP布局与MTP分享路径，未确认产品代码中的功能缺陷。此结论不构成硬件正确性证明。
+
+发现并在同一轮修复的测试问题：
+
+1. callable `apply_model/collective_rpc`默认不能序列化；整个GPU测试模块现在显式请求仓库已有`enable_pickle` fixture，只在测试作用域启用，没有修改持久安全设置。该RPC路径的GPU运行仍未验证。
+2. 原测试先要求greedy token逐个相等，可能在batch变化造成近似argmax分歧时误报。将其按实际影响提升为需要修复的问题：固定prompt历史的所有位置比较完整词表；sample历史只比较到首次生成token分歧（包含该分歧步的完整分布），后续不同历史不比较。`atol/rtol=1e-3`未改变。
+
+数值比较工具新增3项CPU回归，先因缺少该检查函数收集失败，再实现并整套40项通过；没有构造假vLLM模型/输出对象。没有把“缺enable_pickle”的真实GPU失败或修复声称为本机已复现/通过。
+
+审阅保留判断的项目是GPU、真实SP collective、ROCm、graph和完整模型精度；均继续列为未验证。审阅提出的两项测试问题已处理，无延期的Minor项。

@@ -10,8 +10,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.models.glm5next.pp_fixtures import save_tiny_glm5next_checkpoint
+from tests.models.glm5next.pp_fixtures import (
+    assert_pp_logprobs_close,
+    save_tiny_glm5next_checkpoint,
+)
 from vllm import SamplingParams
+
+pytestmark = pytest.mark.usefixtures("enable_pickle")
 
 PARTITIONS = ["4,4,4,5", "5,4,4,4", "7,4,3,3"]
 PROMPTS = [{"prompt_token_ids": list(range(1, n + 1))} for n in (3, 5, 33)]
@@ -105,25 +110,24 @@ def _run(vllm_runner, checkpoint, tp, pp, partition, monkeypatch):
 def _compare_full_logprobs(reference, actual):
     assert len(reference) == len(actual)
     for expected, received in zip(reference, actual):
-        assert expected.outputs[0].token_ids == received.outputs[0].token_ids
-        groups = (
-            (expected.prompt_logprobs, received.prompt_logprobs),
-            (expected.outputs[0].logprobs, received.outputs[0].logprobs),
+
+        def values(steps):
+            return [
+                {key: value.logprob for key, value in step.items()}
+                if step is not None
+                else None
+                for step in steps
+            ]
+
+        assert_pp_logprobs_close(
+            values(expected.prompt_logprobs), values(received.prompt_logprobs)
         )
-        for expected_steps, received_steps in groups:
-            assert len(expected_steps) == len(received_steps)
-            for before, after in zip(expected_steps, received_steps):
-                if before is None:
-                    assert after is None
-                    continue
-                assert before.keys() == after.keys()
-                keys = sorted(before)
-                torch.testing.assert_close(
-                    torch.tensor([before[k].logprob for k in keys]),
-                    torch.tensor([after[k].logprob for k in keys]),
-                    atol=1e-3,
-                    rtol=1e-3,
-                )
+        assert_pp_logprobs_close(
+            values(expected.outputs[0].logprobs),
+            values(received.outputs[0].logprobs),
+            reference_tokens=expected.outputs[0].token_ids,
+            actual_tokens=received.outputs[0].token_ids,
+        )
 
 
 @pytest.mark.distributed(num_gpus=4)

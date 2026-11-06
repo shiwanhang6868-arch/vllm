@@ -228,3 +228,28 @@ def test_post_and_comb_are_observable_inputs_not_discardable_metadata():
     assert not torch.equal(
         expected, ops.mhc_post_torch(x, residual, post, comb.transpose(-1, -2))
     )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 4, 5, 17])
+def test_tp4_shard_payloads_restore_token_order_and_trim_padding(num_tokens):
+    """Check SP tensor layout algebra, not real distributed collectives."""
+    state = _state(num_tokens)
+    padding = (-num_tokens) % 4
+    shards = []
+    for rank in range(4):
+        values = []
+        for tensor in state.tensors.values():
+            pad = (0, 0) * (tensor.ndim - 1) + (0, padding)
+            shard = F.pad(tensor, pad).chunk(4, dim=0)[rank]
+            values.append(shard)
+        packed = pack_mhc_intermediate_tensors(*values)
+        shards.append(
+            _copy_through_runner_buffer(packed, _allocate(values[0].shape[0]))
+        )
+    restored = IntermediateTensors(
+        {
+            key: torch.cat([shard[key] for shard in shards], dim=0)[:num_tokens]
+            for key in state.tensors
+        }
+    )
+    assert restored == state

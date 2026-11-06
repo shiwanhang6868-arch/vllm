@@ -151,6 +151,8 @@ def test_glm5next_tp4_pp4_real_logits(vllm_runner, checkpoint, monkeypatch):
 def _check_mtp_embedding_loads(worker, model_path):
     from safetensors.torch import load_file
 
+    from vllm.distributed import get_pp_group
+
     draft = worker.get_draft_model()
     if draft is None:
         return None
@@ -158,9 +160,14 @@ def _check_mtp_embedding_loads(worker, model_path):
     embedding = draft.model.embed_tokens
     target_name = "model.embed_tokens.weight"
     expected = weights[target_name].bfloat16()
-    assert draft.has_own_embed_tokens
     assert torch.equal(embedding.weight.cpu(), expected)
     marker = ("model.layers.17.enorm.weight", torch.ones(256))
+    if get_pp_group().world_size == 1:
+        assert not draft.has_own_embed_tokens
+        assert embedding is worker.get_model().model.embed_tokens
+        draft.load_weights([marker])
+        return True
+    assert draft.has_own_embed_tokens
     explicit_name = "model.layers.17.embed_tokens.weight"
     explicit = expected + 0.5
     for prefix in ("model.", "model.language_model."):
@@ -175,15 +182,19 @@ def _check_mtp_embedding_loads(worker, model_path):
 
 
 @pytest.mark.distributed(num_gpus=4)
-def test_glm5next_mtp_pp_embedding(vllm_runner, tmp_path, monkeypatch):
+@pytest.mark.parametrize("pp_size", [1, 4])
+def test_glm5next_mtp_pp_embedding(vllm_runner, tmp_path, monkeypatch, pp_size):
     path = tmp_path / "mtp"
     save_tiny_glm5next_checkpoint(path, multimodal=False, mtp=True)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", PARTITIONS[0])
+    if pp_size > 1:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", PARTITIONS[0])
+    else:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     with vllm_runner(
         str(path),
         dtype="bfloat16",
-        pipeline_parallel_size=4,
+        pipeline_parallel_size=pp_size,
         distributed_executor_backend="mp",
         skip_tokenizer_init=True,
         enforce_eager=True,

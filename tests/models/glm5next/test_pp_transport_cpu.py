@@ -124,6 +124,7 @@ def test_missing_boundary_state_is_an_error(key):
         ("residual", torch.zeros(3, HIDDEN, STREAMS, dtype=torch.bfloat16)),
         ("residual", torch.zeros(3, STREAMS, HIDDEN)),
         ("hidden_states", torch.zeros(3, HIDDEN)),
+        ("hidden_states", torch.tensor(0, dtype=torch.bfloat16)),
         ("post", torch.empty(3, STREAMS, 1, device="meta")),
     ],
 )

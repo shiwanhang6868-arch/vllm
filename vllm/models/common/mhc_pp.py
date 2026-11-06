@@ -46,6 +46,8 @@ def unpack_mhc_intermediate_tensors(
         if key not in tensors.tensors or not isinstance(tensors[key], torch.Tensor):
             raise ValueError(f"Missing mHC pipeline tensor: {key}")
     hidden_states = tensors["hidden_states"]
+    if hidden_states.ndim != 2:
+        raise ValueError("Invalid mHC pipeline hidden_states: expected [tokens, H]")
     num_tokens = hidden_states.shape[0]
     expected = (
         ((num_tokens, hidden_size), torch.bfloat16),

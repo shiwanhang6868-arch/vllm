@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from functools import partial
 from typing import ClassVar, Literal
 
 import torch
@@ -16,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -78,9 +80,15 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
+)
+from vllm.models.common.mhc_pp import (
+    make_empty_mhc_intermediate_tensors,
+    pack_mhc_intermediate_tensors,
+    unpack_mhc_intermediate_tensors,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -706,6 +714,33 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         _validate_supported_config(config)
         self.config = config
 
+        pp = get_pp_group()
+        if pp.world_size > 1:
+            for rank in range(pp.world_size):
+                start, end = get_pp_indices(
+                    config.num_hidden_layers, rank, pp.world_size
+                )
+                if not 0 <= start < end <= config.num_hidden_layers:
+                    raise ValueError("GLM5Next requires nonempty, valid PP partitions")
+            if config.mhc and vllm_config.model_config.dtype != torch.bfloat16:
+                raise ValueError("GLM5Next mHC pipeline activations require bfloat16")
+
+        self.make_empty_intermediate_tensors: Callable[
+            [int, torch.dtype, torch.device], IntermediateTensors
+        ]
+        if config.mhc:
+            self.make_empty_intermediate_tensors = partial(
+                make_empty_mhc_intermediate_tensors,
+                hidden_size=config.hidden_size,
+                hc_mult=config.hc_mult,
+            )
+        else:
+            self.make_empty_intermediate_tensors = (
+                make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual"], config.hidden_size
+                )
+            )
+
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
 
@@ -797,7 +832,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if get_pp_group().world_size > 1 and self.aux_hidden_state_layers:
+            raise ValueError(
+                "GLM5Next auxiliary hidden states are not supported with PP"
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -807,17 +846,34 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             post = None
             comb = None
         else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
-            post = None
-            comb = None
+            if intermediate_tensors is None:
+                raise ValueError(
+                    "GLM5Next non-first PP stage needs intermediate tensors"
+                )
+            if self.config.mhc:
+                hidden_states, residual, post, comb = unpack_mhc_intermediate_tensors(
+                    intermediate_tensors,
+                    hidden_size=self.config.hidden_size,
+                    hc_mult=self.config.hc_mult,
+                )
+            else:
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors["residual"]
+                post = comb = None
 
         full_num_tokens = positions.shape[0]
+        if get_pp_group().world_size > 1 and hidden_states.shape[0] != full_num_tokens:
+            raise ValueError(
+                "GLM5Next PP state and positions have different token counts"
+            )
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
+            if residual is not None:
+                residual = sp_shard(residual)
+            if post is not None:
+                post = sp_shard(post)
+            if comb is not None:
+                comb = sp_shard(comb)
 
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(self._active_layers, start=self.start_layer):
@@ -833,11 +889,24 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
+            assert residual is not None
+            if self.config.mhc:
+                assert post is not None and comb is not None
+                if self.is_sequence_parallel:
+                    # PP's TP-sliced transport expects replicated full tensors.
+                    # Collectives take 2-D inputs; preserve each trailing shape.
+                    hidden_states, residual, post, comb = (
+                        sp_all_gather(t.flatten(1))[:full_num_tokens].reshape(
+                            full_num_tokens, *t.shape[1:]
+                        )
+                        for t in (hidden_states, residual, post, comb)
+                    )
+                return pack_mhc_intermediate_tensors(
+                    hidden_states, residual, post, comb
+                )
+            if self.is_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+                residual = sp_all_gather(residual)[:full_num_tokens]
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -922,6 +991,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+            # Filter remote layers before FP8 helpers buffer/dequantize weights
+            # and look up their fused parameters in this stage's params_dict.
+            if is_pp_missing_parameter(name, self):
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -1057,6 +1130,9 @@ class Glm5NextForCausalLM(
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -1080,7 +1156,7 @@ class Glm5NextForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
@@ -1232,9 +1308,9 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
